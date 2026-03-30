@@ -1,12 +1,23 @@
 // calc.rs — 200阶魔方多线程求解器 + 原生 HTTP API
 // 编译: rustc -C opt-level=2 --edition 2021 -o calc calc.rs
-// 运行: ./calc          (读取当前目录 data.bin，监听 127.0.0.1:62001)
+// 运行: ./calc  (读取当前目录 data.bin，监听 127.0.0.1:62001)
+//
+// API 端点:
+//   GET  /health   — 健康检查（始终返回 "OK"）
+//   GET  /status   — 5次/秒：精简进度 JSON（≈200字节）
+//   GET  /cube     — 按需：完整魔方数据 Base64 JSON（≈330KB）
+//   POST /control  — 指令：start | pause | shutdown
+//
+// 协议约定（与 windows.py 对齐）:
+//   Python 端首次连接时请求 GET /cube 获取完整初始状态并渲染；
+//   之后以 5Hz 轮询 GET /status 更新进度指标；
+//   每次 Tick 后 /cube 同步更新，Python 可随时拉取最新完整状态。
 //
 // 线程模型:
-//   main          : 启动所有线程，阻塞等待
-//   scheduler (1) : HTTP服务器 + 200Hz Tick，管理全局状态
-//   explorer  (8) : 并行探索下一步最优走法
-//   executor  (1) : 汇总探索结果，执行最优步，更新全局魔方
+//   scheduler (1) : 非阻塞 HTTP + 200ms Tick（5Hz）
+//   broadcaster(1): 快照扇出到探索器
+//   explorer  (8) : 并行探索最优步
+//   executor  (1) : 汇总结果，修改全局状态
 //
 // 严格仅限 std，零第三方依赖。
 
@@ -28,15 +39,14 @@ use std::{
 const N: usize = 200;
 const FACES: usize = 6;
 const FACE_SIZE: usize = N * N;
-const TOTAL: usize = FACES * FACE_SIZE;
+const TOTAL: usize = FACES * FACE_SIZE; // 240_000
 
 const EXPLORER_COUNT: usize = 8;
 const HTTP_ADDR: &str = "127.0.0.1:62001";
 
-/// 调度 Tick 间隔：5ms → 200Hz
-const TICK_INTERVAL: Duration = Duration::from_millis(5);
+/// 5Hz Tick（每 200ms 刷新一次状态快照和 cube 快照）
+const TICK_INTERVAL: Duration = Duration::from_millis(200);
 
-// 六面索引（URFDLB 标准）
 const U_FACE: usize = 0;
 const R_FACE: usize = 1;
 const F_FACE: usize = 2;
@@ -45,183 +55,147 @@ const L_FACE: usize = 4;
 const B_FACE: usize = 5;
 
 // ============================================================
-// 移动动作定义
+// 手写 Base64 编码（RFC 4648，无换行）
+// 标准库无内建实现，约 50 行，覆盖全部边界情况。
 // ============================================================
 
-/// 一个原子移动：(轴, 层, 方向)
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Move {
-    pub axis: u8,      // 0=U/D轴, 1=R/L轴, 2=F/B轴
-    pub layer: u16,    // 0..N
-    pub cw: bool,      // true=顺时针
+const B64_TABLE: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let len = data.len();
+    let mut out = Vec::with_capacity((len + 2) / 3 * 4);
+    let mut i = 0;
+    while i + 2 < len {
+        let (b0, b1, b2) = (data[i] as usize, data[i+1] as usize, data[i+2] as usize);
+        out.push(B64_TABLE[b0 >> 2]);
+        out.push(B64_TABLE[((b0 & 3) << 4) | (b1 >> 4)]);
+        out.push(B64_TABLE[((b1 & 0xf) << 2) | (b2 >> 6)]);
+        out.push(B64_TABLE[b2 & 0x3f]);
+        i += 3;
+    }
+    if i < len {
+        let b0 = data[i] as usize;
+        out.push(B64_TABLE[b0 >> 2]);
+        if i + 1 < len {
+            let b1 = data[i+1] as usize;
+            out.push(B64_TABLE[((b0 & 3) << 4) | (b1 >> 4)]);
+            out.push(B64_TABLE[(b1 & 0xf) << 2]);
+        } else {
+            out.push(B64_TABLE[(b0 & 3) << 4]);
+            out.push(b'=');
+        }
+        out.push(b'=');
+    }
+    // SAFETY: B64_TABLE 仅含 ASCII
+    unsafe { String::from_utf8_unchecked(out) }
 }
+
+// ============================================================
+// Move
+// ============================================================
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Move { pub axis: u8, pub layer: u16, pub cw: bool }
 
 impl Move {
-    #[inline]
-    pub fn inverse(self) -> Self {
-        Move { axis: self.axis, layer: self.layer, cw: !self.cw }
-    }
+    #[inline] pub fn inverse(self) -> Self { Move { cw: !self.cw, ..self } }
 }
 
 // ============================================================
-// 魔方核心数据结构与操作（内联高性能版）
+// CubeState
 // ============================================================
 
-/// 魔方状态——堆分配的固定大小一维 u8 数组
-/// 布局：data[face * N*N + row * N + col]，颜色 0-5
 #[derive(Clone)]
-pub struct CubeState {
-    pub data: Box<[u8; TOTAL]>,
-}
+pub struct CubeState { pub data: Box<[u8; TOTAL]> }
 
 impl CubeState {
-    pub fn new_zeroed() -> Self {
-        CubeState { data: Box::new([0u8; TOTAL]) }
-    }
+    pub fn new_zeroed() -> Self { CubeState { data: Box::new([0u8; TOTAL]) } }
 
-    /// 从原始字节切片加载（长度必须为 TOTAL）
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        assert_eq!(bytes.len(), TOTAL, "data.bin 大小不符：期望 {} 字节", TOTAL);
+        assert_eq!(bytes.len(), TOTAL);
         let mut s = Self::new_zeroed();
         s.data.copy_from_slice(bytes);
         s
     }
 
-    #[inline(always)]
-    fn idx(f: usize, r: usize, c: usize) -> usize {
-        f * FACE_SIZE + r * N + c
-    }
+    #[inline(always)] fn idx(f: usize, r: usize, c: usize) -> usize { f*FACE_SIZE + r*N + c }
+    #[inline(always)] pub fn get(&self, f: usize, r: usize, c: usize) -> u8 { self.data[Self::idx(f,r,c)] }
+    #[inline(always)] pub fn set(&mut self, f: usize, r: usize, c: usize, v: u8) { self.data[Self::idx(f,r,c)] = v; }
 
-    #[inline(always)]
-    pub fn get(&self, f: usize, r: usize, c: usize) -> u8 {
-        self.data[Self::idx(f, r, c)]
-    }
-
-    #[inline(always)]
-    pub fn set(&mut self, f: usize, r: usize, c: usize, v: u8) {
-        self.data[Self::idx(f, r, c)] = v;
-    }
-
-    // ----------------------------------------------------------
-    // 面片旋转（原地）
-    // ----------------------------------------------------------
-
-    /// 顺时针旋转面 f（转置 + 行翻转）
     fn rotate_face_cw(&mut self, f: usize) {
-        let base = f * FACE_SIZE;
-        let s = &mut self.data[base..base + FACE_SIZE];
-        for r in 0..N {
-            for c in (r + 1)..N {
-                s.swap(r * N + c, c * N + r);
-            }
-        }
-        for r in 0..N {
-            s[r * N..r * N + N].reverse();
-        }
+        let b = f * FACE_SIZE;
+        let s = &mut self.data[b..b+FACE_SIZE];
+        for r in 0..N { for c in (r+1)..N { s.swap(r*N+c, c*N+r); } }
+        for r in 0..N { s[r*N..r*N+N].reverse(); }
     }
-
-    /// 逆时针旋转面 f（行翻转 + 转置）
     fn rotate_face_ccw(&mut self, f: usize) {
-        let base = f * FACE_SIZE;
-        let s = &mut self.data[base..base + FACE_SIZE];
-        for r in 0..N {
-            s[r * N..r * N + N].reverse();
-        }
-        for r in 0..N {
-            for c in (r + 1)..N {
-                s.swap(r * N + c, c * N + r);
-            }
-        }
+        let b = f * FACE_SIZE;
+        let s = &mut self.data[b..b+FACE_SIZE];
+        for r in 0..N { s[r*N..r*N+N].reverse(); }
+        for r in 0..N { for c in (r+1)..N { s.swap(r*N+c, c*N+r); } }
     }
 
-    // ----------------------------------------------------------
-    // 棱带交换——三轴实现
-    // ----------------------------------------------------------
-
-    /// U/D 轴水平层（行方向）移动
-    /// layer=0 → U面；layer=N-1 → D面
-    /// 顺时针（从U往下看）: F → R → B(镜像) → L → F
     #[inline]
     pub fn move_u_axis(&mut self, layer: usize, cw: bool) {
         let mut tmp = [0u8; N];
         for c in 0..N { tmp[c] = self.get(F_FACE, layer, c); }
         if cw {
-            for c in 0..N { let v = self.get(L_FACE, layer, c);           self.set(F_FACE, layer, c, v); }
-            for c in 0..N { let v = self.get(B_FACE, N-1-layer, N-1-c);   self.set(L_FACE, layer, c, v); }
-            for c in 0..N { let v = self.get(R_FACE, layer, N-1-c);       self.set(B_FACE, N-1-layer, c, v); }
-            for c in 0..N { self.set(R_FACE, layer, c, tmp[c]); }
+            for c in 0..N { let v=self.get(L_FACE,layer,c);         self.set(F_FACE,layer,c,v); }
+            for c in 0..N { let v=self.get(B_FACE,N-1-layer,N-1-c); self.set(L_FACE,layer,c,v); }
+            for c in 0..N { let v=self.get(R_FACE,layer,N-1-c);     self.set(B_FACE,N-1-layer,c,v); }
+            for c in 0..N { self.set(R_FACE,layer,c,tmp[c]); }
         } else {
-            for c in 0..N { let v = self.get(R_FACE, layer, c);           self.set(F_FACE, layer, c, v); }
-            for c in 0..N { let v = self.get(B_FACE, N-1-layer, N-1-c);   self.set(R_FACE, layer, c, v); }
-            for c in 0..N { let v = self.get(L_FACE, layer, N-1-c);       self.set(B_FACE, N-1-layer, c, v); }
-            for c in 0..N { self.set(L_FACE, layer, c, tmp[c]); }
+            for c in 0..N { let v=self.get(R_FACE,layer,c);         self.set(F_FACE,layer,c,v); }
+            for c in 0..N { let v=self.get(B_FACE,N-1-layer,N-1-c); self.set(R_FACE,layer,c,v); }
+            for c in 0..N { let v=self.get(L_FACE,layer,N-1-c);     self.set(B_FACE,N-1-layer,c,v); }
+            for c in 0..N { self.set(L_FACE,layer,c,tmp[c]); }
         }
-        if layer == 0 {
-            if cw { self.rotate_face_cw(U_FACE); } else { self.rotate_face_ccw(U_FACE); }
-        } else if layer == N - 1 {
-            if cw { self.rotate_face_ccw(D_FACE); } else { self.rotate_face_cw(D_FACE); }
-        }
+        if layer==0 { if cw {self.rotate_face_cw(U_FACE);} else {self.rotate_face_ccw(U_FACE);} }
+        else if layer==N-1 { if cw {self.rotate_face_ccw(D_FACE);} else {self.rotate_face_cw(D_FACE);} }
     }
 
-    /// R/L 轴竖直列移动
-    /// layer=0 → R面最外列；layer=N-1 → L面最外列
-    /// 顺时针（从R往左看）: U → F → D → B(翻转) → U
     #[inline]
     pub fn move_r_axis(&mut self, layer: usize, cw: bool) {
-        let col_f = N - 1 - layer;
-        let col_b = layer;
+        let (cf, cb) = (N-1-layer, layer);
         let mut tmp = [0u8; N];
-        for r in 0..N { tmp[r] = self.get(U_FACE, r, col_f); }
+        for r in 0..N { tmp[r] = self.get(U_FACE,r,cf); }
         if cw {
-            for r in 0..N { let v = self.get(F_FACE, r, col_f);     self.set(U_FACE, r, col_f, v); }
-            for r in 0..N { let v = self.get(D_FACE, r, col_f);     self.set(F_FACE, r, col_f, v); }
-            for r in 0..N { let v = self.get(B_FACE, N-1-r, col_b); self.set(D_FACE, r, col_f, v); }
-            for r in 0..N { self.set(B_FACE, N-1-r, col_b, tmp[r]); }
+            for r in 0..N { let v=self.get(F_FACE,r,cf);     self.set(U_FACE,r,cf,v); }
+            for r in 0..N { let v=self.get(D_FACE,r,cf);     self.set(F_FACE,r,cf,v); }
+            for r in 0..N { let v=self.get(B_FACE,N-1-r,cb); self.set(D_FACE,r,cf,v); }
+            for r in 0..N { self.set(B_FACE,N-1-r,cb,tmp[r]); }
         } else {
-            for r in 0..N { let v = self.get(B_FACE, N-1-r, col_b); self.set(U_FACE, r, col_f, v); }
-            for r in 0..N { let v = self.get(D_FACE, N-1-r, col_f); self.set(B_FACE, r, col_b, v); }
-            for r in 0..N { let v = self.get(F_FACE, r, col_f);     self.set(D_FACE, r, col_f, v); }
-            for r in 0..N { self.set(F_FACE, r, col_f, tmp[r]); }
+            for r in 0..N { let v=self.get(B_FACE,N-1-r,cb); self.set(U_FACE,r,cf,v); }
+            for r in 0..N { let v=self.get(D_FACE,N-1-r,cf); self.set(B_FACE,r,cb,v); }
+            for r in 0..N { let v=self.get(F_FACE,r,cf);     self.set(D_FACE,r,cf,v); }
+            for r in 0..N { self.set(F_FACE,r,cf,tmp[r]); }
         }
-        if layer == 0 {
-            if cw { self.rotate_face_cw(R_FACE); } else { self.rotate_face_ccw(R_FACE); }
-        } else if layer == N - 1 {
-            if cw { self.rotate_face_ccw(L_FACE); } else { self.rotate_face_cw(L_FACE); }
-        }
+        if layer==0 { if cw {self.rotate_face_cw(R_FACE);} else {self.rotate_face_ccw(R_FACE);} }
+        else if layer==N-1 { if cw {self.rotate_face_ccw(L_FACE);} else {self.rotate_face_cw(L_FACE);} }
     }
 
-    /// F/B 轴深度切片移动
-    /// layer=0 → F面；layer=N-1 → B面
-    /// 顺时针（从F往后看）: U底行 → R左列 → D顶行(翻转) → L右列(翻转) → U
     #[inline]
     pub fn move_f_axis(&mut self, layer: usize, cw: bool) {
-        let row_u = N - 1 - layer;
-        let row_d = layer;
-        let col_r = layer;
-        let col_l = N - 1 - layer;
+        let (ru, rd, cr, cl) = (N-1-layer, layer, layer, N-1-layer);
         let mut tmp = [0u8; N];
-        for c in 0..N { tmp[c] = self.get(U_FACE, row_u, c); }
+        for c in 0..N { tmp[c] = self.get(U_FACE,ru,c); }
         if cw {
-            for c in 0..N { let v = self.get(L_FACE, N-1-c, col_l); self.set(U_FACE, row_u, c, v); }
-            for r in 0..N { let v = self.get(D_FACE, row_d, N-1-r); self.set(L_FACE, r, col_l, v); }
-            for c in 0..N { let v = self.get(R_FACE, c, col_r);     self.set(D_FACE, row_d, c, v); }
-            for r in 0..N { self.set(R_FACE, r, col_r, tmp[r]); }
+            for c in 0..N { let v=self.get(L_FACE,N-1-c,cl); self.set(U_FACE,ru,c,v); }
+            for r in 0..N { let v=self.get(D_FACE,rd,N-1-r); self.set(L_FACE,r,cl,v); }
+            for c in 0..N { let v=self.get(R_FACE,c,cr);     self.set(D_FACE,rd,c,v); }
+            for r in 0..N { self.set(R_FACE,r,cr,tmp[r]); }
         } else {
-            for c in 0..N { let v = self.get(R_FACE, c, col_r);     self.set(U_FACE, row_u, c, v); }
-            for r in 0..N { let v = self.get(D_FACE, row_d, N-1-r); self.set(R_FACE, r, col_r, v); }
-            for c in 0..N { let v = self.get(L_FACE, c, col_l);     self.set(D_FACE, row_d, c, v); }
-            for r in 0..N { self.set(L_FACE, r, col_l, tmp[N-1-r]); }
+            for c in 0..N { let v=self.get(R_FACE,c,cr);     self.set(U_FACE,ru,c,v); }
+            for r in 0..N { let v=self.get(D_FACE,rd,N-1-r); self.set(R_FACE,r,cr,v); }
+            for c in 0..N { let v=self.get(L_FACE,c,cl);     self.set(D_FACE,rd,c,v); }
+            for r in 0..N { self.set(L_FACE,r,cl,tmp[N-1-r]); }
         }
-        if layer == 0 {
-            if cw { self.rotate_face_cw(F_FACE); } else { self.rotate_face_ccw(F_FACE); }
-        } else if layer == N - 1 {
-            if cw { self.rotate_face_ccw(B_FACE); } else { self.rotate_face_cw(B_FACE); }
-        }
+        if layer==0 { if cw {self.rotate_face_cw(F_FACE);} else {self.rotate_face_ccw(F_FACE);} }
+        else if layer==N-1 { if cw {self.rotate_face_ccw(B_FACE);} else {self.rotate_face_cw(B_FACE);} }
     }
 
-    /// 统一入口：执行一个 Move
-    #[inline]
-    pub fn apply(&mut self, mv: Move) {
+    #[inline] pub fn apply(&mut self, mv: Move) {
         match mv.axis {
             0 => self.move_u_axis(mv.layer as usize, mv.cw),
             1 => self.move_r_axis(mv.layer as usize, mv.cw),
@@ -229,335 +203,173 @@ impl CubeState {
             _ => unreachable!(),
         }
     }
+    #[inline] pub fn apply_seq(&mut self, moves: &[Move]) { for &m in moves { self.apply(m); } }
 
-    /// 执行一组 Move
-    #[inline]
-    pub fn apply_seq(&mut self, moves: &[Move]) {
-        for &mv in moves { self.apply(mv); }
-    }
-
-    // ----------------------------------------------------------
-    // 启发式评估函数（降阶法代价估算）
-    // ----------------------------------------------------------
-
-    /// 统计"已归位"格子数：颜色与所属面编号一致的格子
     pub fn solved_count(&self) -> u32 {
-        let mut count = 0u32;
-        for f in 0..FACES {
-            let expected = f as u8;
-            let base = f * FACE_SIZE;
-            for i in 0..FACE_SIZE {
-                if self.data[base + i] == expected {
-                    count += 1;
-                }
-            }
-        }
-        count
+        let mut n = 0u32;
+        for f in 0..FACES { let e=f as u8; let b=f*FACE_SIZE;
+            for i in 0..FACE_SIZE { if self.data[b+i]==e { n+=1; } } }
+        n
     }
-
-    /// 每面中心块（内部 (N-2)×(N-2) 区域）已归位数
-    /// 降阶法第一阶段目标：先将六面中心全部归位
     pub fn center_solved_count(&self) -> u32 {
-        let mut count = 0u32;
-        for f in 0..FACES {
-            let expected = f as u8;
-            for r in 1..N-1 {
-                for c in 1..N-1 {
-                    if self.get(f, r, c) == expected { count += 1; }
-                }
-            }
-        }
-        count
+        let mut n = 0u32;
+        for f in 0..FACES { let e=f as u8;
+            for r in 1..N-1 { for c in 1..N-1 { if self.get(f,r,c)==e { n+=1; } } } }
+        n
     }
-
-    /// 棱块（边缘但非角块）已归位数
-    /// 降阶法第二阶段目标
     pub fn edge_solved_count(&self) -> u32 {
-        let mut count = 0u32;
-        // 检查每条棱线（每面四条边，各 N-2 个非角格子）
-        for f in 0..FACES {
-            let expected = f as u8;
-            // 顶行
-            for c in 1..N-1 { if self.get(f, 0, c) == expected { count += 1; } }
-            // 底行
-            for c in 1..N-1 { if self.get(f, N-1, c) == expected { count += 1; } }
-            // 左列
-            for r in 1..N-1 { if self.get(f, r, 0) == expected { count += 1; } }
-            // 右列
-            for r in 1..N-1 { if self.get(f, r, N-1) == expected { count += 1; } }
+        let mut n = 0u32;
+        for f in 0..FACES { let e=f as u8;
+            for c in 1..N-1 { if self.get(f,0,c)==e { n+=1; } if self.get(f,N-1,c)==e { n+=1; } }
+            for r in 1..N-1 { if self.get(f,r,0)==e { n+=1; } if self.get(f,r,N-1)==e { n+=1; } }
         }
-        count
+        n
     }
+    pub fn heuristic_cost(&self) -> i64 { TOTAL as i64 - self.solved_count() as i64 }
 
-    /// 综合启发代价（越小越好；已解决的格子越多，代价越低）
-    pub fn heuristic_cost(&self) -> i64 {
-        let total = TOTAL as i64;
-        let solved = self.solved_count() as i64;
-        // 归一化为"未归位格子数"
-        total - solved
-    }
+    /// 序列化为 Base64（供 /cube 端点，≈320KB 字符串）
+    pub fn to_base64(&self) -> String { base64_encode(&*self.data) }
 }
 
 // ============================================================
 // 降阶法求解骨架
 // ============================================================
 
-/// 求解阶段
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SolvePhase {
-    /// 阶段1：归位六面中心块（大魔方最耗时的阶段）
-    CenterReduction,
-    /// 阶段2：配对并归位棱块
-    EdgePairing,
-    /// 阶段3：当中心和棱均就位后，按3阶算法求解
-    ThreeByThreeReduction,
-    /// 已完成
-    Solved,
+pub enum SolvePhase { CenterReduction, EdgePairing, ThreeByThreeReduction, Solved }
+
+pub fn detect_phase(s: &CubeState) -> SolvePhase {
+    if s.solved_count() as usize == TOTAL { return SolvePhase::Solved; }
+    if (s.center_solved_count() as usize) < FACES*(N-2)*(N-2) { return SolvePhase::CenterReduction; }
+    if (s.edge_solved_count() as usize)   < FACES*4*(N-2)     { return SolvePhase::EdgePairing; }
+    SolvePhase::ThreeByThreeReduction
 }
 
-/// 判断当前处于哪个求解阶段
-pub fn detect_phase(state: &CubeState) -> SolvePhase {
-    let total_centers = FACES * (N - 2) * (N - 2);
-    let total_edges = FACES * 4 * (N - 2);
-
-    let centers = state.center_solved_count() as usize;
-    let edges = state.edge_solved_count() as usize;
-    let solved = state.solved_count() as usize;
-
-    if solved == TOTAL {
-        SolvePhase::Solved
-    } else if centers < total_centers {
-        SolvePhase::CenterReduction
-    } else if edges < total_edges {
-        SolvePhase::EdgePairing
-    } else {
-        SolvePhase::ThreeByThreeReduction
-    }
-}
-
-// ---- 阶段1：中心块归位辅助 ----
-
-/// 生成"将面 `target_face` 第 r 行的中心条带移动到正确位置"的候选动作序列。
-/// 实际大魔方求解器会有数十种具体手法；此处提供核心框架，
-/// 探索线程会从这些候选中选代价最低的。
-pub fn center_candidate_moves(
-    _state: &CubeState,
-    target_face: usize,
-    layer: usize,
-) -> Vec<Vec<Move>> {
-    // 对目标面，尝试用同轴的层移动把该层的颜色推入正确面
-    // 这里生成四个基本候选：顺/逆时针，两种轴
-    let axis_for_face = [0u8, 1, 2, 0, 1, 2]; // 每个面对应的主轴
-    let ax = axis_for_face[target_face];
+pub fn center_candidate_moves(_: &CubeState, face: usize, layer: usize) -> Vec<Vec<Move>> {
+    let ax = [0u8,1,2,0,1,2][face];
     vec![
-        vec![Move { axis: ax, layer: layer as u16, cw: true }],
-        vec![Move { axis: ax, layer: layer as u16, cw: false }],
-        // 双层复合动作（先移入再调整）
-        vec![
-            Move { axis: ax, layer: layer as u16, cw: true },
-            Move { axis: (ax + 1) % 3, layer: (N / 2) as u16, cw: true },
-            Move { axis: ax, layer: layer as u16, cw: false },
-        ],
-        vec![
-            Move { axis: ax, layer: layer as u16, cw: false },
-            Move { axis: (ax + 2) % 3, layer: (N / 2) as u16, cw: false },
-            Move { axis: ax, layer: layer as u16, cw: true },
-        ],
+        vec![Move{axis:ax,layer:layer as u16,cw:true}],
+        vec![Move{axis:ax,layer:layer as u16,cw:false}],
+        vec![Move{axis:ax,layer:layer as u16,cw:true},  Move{axis:(ax+1)%3,layer:(N/2)as u16,cw:true},  Move{axis:ax,layer:layer as u16,cw:false}],
+        vec![Move{axis:ax,layer:layer as u16,cw:false}, Move{axis:(ax+2)%3,layer:(N/2)as u16,cw:false}, Move{axis:ax,layer:layer as u16,cw:true}],
     ]
 }
 
-// ---- 阶段2：棱块配对辅助 ----
-
-/// 棱块配对的候选移动：将散落在各处的同色棱块两两配对。
-/// 核心手法：U层隔离 + 切片插入 + U层恢复
 pub fn edge_pairing_candidates(layer: usize) -> Vec<Vec<Move>> {
-    // 标准"翻转插入"手法的4种变体
     let l = layer as u16;
     vec![
-        vec![
-            Move { axis: 0, layer: 0,    cw: true  },
-            Move { axis: 1, layer: l,    cw: true  },
-            Move { axis: 0, layer: 0,    cw: false },
-            Move { axis: 1, layer: l,    cw: false },
-        ],
-        vec![
-            Move { axis: 0, layer: 0,    cw: false },
-            Move { axis: 1, layer: l,    cw: false },
-            Move { axis: 0, layer: 0,    cw: true  },
-            Move { axis: 1, layer: l,    cw: true  },
-        ],
-        vec![
-            Move { axis: 2, layer: 0,    cw: true  },
-            Move { axis: 0, layer: l,    cw: true  },
-            Move { axis: 2, layer: 0,    cw: false },
-            Move { axis: 0, layer: l,    cw: false },
-        ],
-        vec![
-            Move { axis: 2, layer: 0,    cw: false },
-            Move { axis: 0, layer: l,    cw: false },
-            Move { axis: 2, layer: 0,    cw: true  },
-            Move { axis: 0, layer: l,    cw: true  },
-        ],
+        vec![Move{axis:0,layer:0,cw:true}, Move{axis:1,layer:l,cw:true},  Move{axis:0,layer:0,cw:false},Move{axis:1,layer:l,cw:false}],
+        vec![Move{axis:0,layer:0,cw:false},Move{axis:1,layer:l,cw:false}, Move{axis:0,layer:0,cw:true}, Move{axis:1,layer:l,cw:true}],
+        vec![Move{axis:2,layer:0,cw:true}, Move{axis:0,layer:l,cw:true},  Move{axis:2,layer:0,cw:false},Move{axis:0,layer:l,cw:false}],
+        vec![Move{axis:2,layer:0,cw:false},Move{axis:0,layer:l,cw:false}, Move{axis:2,layer:0,cw:true}, Move{axis:0,layer:l,cw:true}],
     ]
 }
 
-// ---- 阶段3：3阶求解占位 ----
-
-/// 将大魔方降阶为等效3阶后，利用 CFOP/Kociemba 算法框架求解。
-/// 此处仅搭建骨架：提取3阶等效状态，并返回基本面旋转候选。
-/// 完整实现需要预计算转换表（约 ~50KB），可在初始化时建立。
 pub fn three_stage_candidates() -> Vec<Vec<Move>> {
-    // 六面各一次旋转，共12个基本动作
-    let layers = [0u16, (N - 1) as u16];
-    let mut candidates = Vec::with_capacity(12);
-    for &layer in &layers {
+    let mut v = Vec::with_capacity(12);
+    for &layer in &[0u16,(N-1)as u16] {
         for axis in 0u8..3 {
-            candidates.push(vec![Move { axis, layer, cw: true }]);
-            candidates.push(vec![Move { axis, layer, cw: false }]);
+            v.push(vec![Move{axis,layer,cw:true}]);
+            v.push(vec![Move{axis,layer,cw:false}]);
         }
     }
-    candidates
+    v
 }
 
 // ============================================================
-// 共享全局状态
+// SharedState
 // ============================================================
 
-/// 求解器运行状态
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunState {
-    Paused,
-    Running,
-}
+pub enum RunState { Paused, Running }
 
-/// 探索线程向执行线程提交的候选结果
-pub struct ExplorerResult {
-    /// 哪个探索器产生（0-7）
-    pub explorer_id: usize,
-    /// 建议执行的动作序列
-    pub moves: Vec<Move>,
-    /// 执行后的预测代价（越小越好）
-    pub predicted_cost: i64,
-    /// 探索耗时
-    pub elapsed_us: u64,
-}
+pub struct ExplorerResult { pub explorer_id: usize, pub moves: Vec<Move>, pub predicted_cost: i64, pub elapsed_us: u64 }
 
-/// 全局共享状态（调度线程与执行线程共用）
 pub struct SharedState {
-    /// 当前魔方状态（执行线程独写，其他只读快照）
     pub cube: Mutex<CubeState>,
-    /// 运行/暂停
     pub run_state: Mutex<RunState>,
-    /// 总已执行步数
     pub total_moves: AtomicU64,
-    /// 总耗时（微秒）
     pub total_elapsed_us: AtomicU64,
-    /// 当前求解阶段（供 HTTP /status 展示）
     pub phase: Mutex<SolvePhase>,
-    /// HTTP /status 快照缓冲（调度线程定期刷新，HTTP 线程只读）
+    /// 精简进度快照，5Hz 刷新，供 GET /status
     pub status_snapshot: RwLock<String>,
-    /// 是否停止所有线程
+    /// 完整魔方 Base64 快照，5Hz 刷新，供 GET /cube
+    pub cube_snapshot: RwLock<String>,
     pub shutdown: AtomicBool,
 }
 
 impl SharedState {
     pub fn new(cube: CubeState) -> Arc<Self> {
-        Arc::new(SharedState {
+        let b64 = cube.to_base64();
+        let cube_json = format!(
+            "{{\"n\":{N},\"faces\":{FACES},\"state\":\"paused\",\"data\":\"{b64}\"}}"
+        );
+        Arc::new(Self {
             cube: Mutex::new(cube),
             run_state: Mutex::new(RunState::Paused),
             total_moves: AtomicU64::new(0),
             total_elapsed_us: AtomicU64::new(0),
             phase: Mutex::new(SolvePhase::CenterReduction),
-            status_snapshot: RwLock::new(String::from("{\"status\":\"initializing\"}")),
+            status_snapshot: RwLock::new("{\"status\":\"initializing\"}".into()),
+            cube_snapshot: RwLock::new(cube_json),
             shutdown: AtomicBool::new(false),
         })
     }
 }
 
 // ============================================================
-// 极简 HTTP 服务器（非阻塞 TcpListener）
+// HTTP 工具
 // ============================================================
 
-/// 解析 HTTP 请求的第一行，返回 (method, path)
 fn parse_request_line(buf: &[u8]) -> Option<(&str, &str)> {
     let text = std::str::from_utf8(buf).ok()?;
-    let mut iter = text.lines();
-    let first = iter.next()?;
-    let mut parts = first.splitn(3, ' ');
-    let method = parts.next()?;
-    let path = parts.next()?;
-    Some((method, path))
+    let first = text.lines().next()?;
+    let mut it = first.splitn(3, ' ');
+    Some((it.next()?, it.next()?))
 }
 
-/// 读取 HTTP 请求体（Content-Length 字节）
-fn read_body(stream: &mut TcpStream, header_end: usize, buf: &[u8]) -> String {
-    // 从已缓冲数据中找 Content-Length
-    let header_str = std::str::from_utf8(&buf[..header_end]).unwrap_or("");
-    let content_length: usize = header_str
-        .lines()
+fn read_body(stream: &mut TcpStream, hdr_end: usize, buf: &[u8]) -> String {
+    let hdr = std::str::from_utf8(&buf[..hdr_end]).unwrap_or("");
+    let cl: usize = hdr.lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
-        .and_then(|l| l.splitn(2, ':').nth(1))
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(0);
-
-    let already = buf.len().saturating_sub(header_end + 4); // 4 = \r\n\r\n
-    let mut body_bytes = buf[header_end + 4..].to_vec();
-    let remaining = content_length.saturating_sub(already);
-    if remaining > 0 {
-        let mut extra = vec![0u8; remaining];
-        let _ = stream.read(&mut extra);
-        body_bytes.extend_from_slice(&extra);
-    }
-    String::from_utf8_lossy(&body_bytes).into_owned()
+        .and_then(|l| l.splitn(2,':').nth(1))
+        .and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+    let body_start = (hdr_end + 4).min(buf.len());
+    let mut body = buf[body_start..].to_vec();
+    let rem = cl.saturating_sub(body.len());
+    if rem > 0 { let mut ex = vec![0u8; rem]; let _ = stream.read(&mut ex); body.extend(ex); }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
-/// 构建 HTTP 响应
-fn http_response(status: u16, content_type: &str, body: &str) -> Vec<u8> {
-    let status_text = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        _   => "Internal Server Error",
-    };
-    format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{}",
-        status, status_text, content_type, body.len(), body
-    ).into_bytes()
+fn http_response(status: u16, ct: &str, body: &str) -> Vec<u8> {
+    let st = match status { 200=>"OK",400=>"Bad Request",404=>"Not Found",405=>"Method Not Allowed",_=>"Error" };
+    format!("HTTP/1.1 {status} {st}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
 }
 
-/// 处理单个 HTTP 连接
 fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
-    // 读取请求（最多 8KB，足够 HTTP header）
     let mut buf = vec![0u8; 8192];
-    let n = match stream.read(&mut buf) {
-        Ok(n) if n > 0 => n,
-        _ => return,
-    };
+    let n = match stream.read(&mut buf) { Ok(n) if n>0 => n, _ => return };
     buf.truncate(n);
+    let hdr_end = buf.windows(4).position(|w| w==b"\r\n\r\n").unwrap_or(n.saturating_sub(4));
 
-    // 找到 header 结束位置
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .unwrap_or(n.saturating_sub(4));
-
-    let response = match parse_request_line(&buf[..header_end.min(n)]) {
+    let response = match parse_request_line(&buf[..hdr_end.min(n)]) {
         None => http_response(400, "text/plain", "Bad Request"),
 
         Some(("GET", "/status")) => {
-            let snap = shared.status_snapshot.read().unwrap();
-            http_response(200, "application/json", &snap)
+            let s = shared.status_snapshot.read().unwrap();
+            http_response(200, "application/json", &s)
         }
 
-        Some(("GET", "/health")) => {
-            http_response(200, "text/plain", "OK")
+        // 完整魔方数据（Base64 编码），首次或按需拉取
+        Some(("GET", "/cube")) => {
+            let s = shared.cube_snapshot.read().unwrap();
+            http_response(200, "application/json", &s)
         }
+
+        Some(("GET", "/health")) => http_response(200, "text/plain", "OK"),
 
         Some(("POST", "/control")) => {
-            let body = read_body(&mut stream, header_end, &buf);
-            let body = body.trim().to_ascii_lowercase();
-
+            let body = read_body(&mut stream, hdr_end, &buf).to_ascii_lowercase();
             let reply = if body.contains("start") || body.contains("resume") {
                 *shared.run_state.lock().unwrap() = RunState::Running;
                 "{\"ok\":true,\"state\":\"running\"}"
@@ -567,442 +379,224 @@ fn handle_connection(mut stream: TcpStream, shared: &Arc<SharedState>) {
             } else if body.contains("shutdown") {
                 shared.shutdown.store(true, Ordering::SeqCst);
                 "{\"ok\":true,\"state\":\"shutdown\"}"
-            } else {
-                "{\"ok\":false,\"error\":\"unknown command\"}"
-            };
+            } else { "{\"ok\":false,\"error\":\"unknown command\"}" };
             http_response(200, "application/json", reply)
         }
 
-        Some((_, "/status")) | Some((_, "/control")) => {
-            http_response(405, "text/plain", "Method Not Allowed")
-        }
+        Some((_, "/status")) | Some((_, "/control")) | Some((_, "/cube")) =>
+            http_response(405, "text/plain", "Method Not Allowed"),
 
         Some(_) => http_response(404, "text/plain", "Not Found"),
     };
-
     let _ = stream.write_all(&response);
 }
 
 // ============================================================
-// 调度线程（Scheduler）
-// ============================================================
-//
-// 职责：
-//   1. 运行 HTTP 服务器（非阻塞 accept）
-//   2. 每 5ms（200Hz）Tick：刷新 status_snapshot，向探索线程广播快照
-//
-// 使用非阻塞 TcpListener，避免 accept() 阻塞 Tick 计时器。
+// 调度线程：非阻塞 HTTP + 5Hz Tick
 // ============================================================
 
-fn scheduler_thread(
-    shared: Arc<SharedState>,
-    snapshot_tx: SyncSender<CubeState>, // 向探索线程广播最新快照
-) {
-    let listener = TcpListener::bind(HTTP_ADDR).expect("绑定 HTTP 端口失败");
+fn scheduler_thread(shared: Arc<SharedState>, snapshot_tx: SyncSender<CubeState>) {
+    let listener = TcpListener::bind(HTTP_ADDR).expect("绑定端口失败");
     listener.set_nonblocking(true).expect("设置非阻塞失败");
-    eprintln!("[scheduler] HTTP 服务器监听 http://{}", HTTP_ADDR);
+    eprintln!("[scheduler] http://{} 已就绪（5Hz Tick）", HTTP_ADDR);
 
     let mut last_tick = Instant::now();
 
     loop {
         if shared.shutdown.load(Ordering::Relaxed) { break; }
 
-        // ---- 非阻塞 accept：处理所有待接受的连接 ----
+        // 非阻塞 accept
         loop {
             match listener.accept() {
-                Ok((stream, _addr)) => {
-                    // 每个连接克隆 Arc，spawn 短生命周期线程处理
-                    let shared_clone = Arc::clone(&shared);
-                    // 设置读写超时防止连接挂起
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
-                    thread::spawn(move || handle_connection(stream, &shared_clone));
+                Ok((s, _)) => {
+                    let _ = s.set_read_timeout(Some(Duration::from_millis(200)));
+                    let _ = s.set_write_timeout(Some(Duration::from_millis(500)));
+                    let sc = Arc::clone(&shared);
+                    thread::spawn(move || handle_connection(s, &sc));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
 
-        // ---- 200Hz Tick ----
-        let now = Instant::now();
-        if now.duration_since(last_tick) >= TICK_INTERVAL {
-            last_tick = now;
+        // 5Hz Tick
+        if last_tick.elapsed() >= TICK_INTERVAL {
+            last_tick = Instant::now();
 
-            // 生成状态快照
-            let (cube_snap, phase, run_st, total_mv, total_us) = {
+            let (cube_snap, phase, run_st, mv, us) = {
                 let cube = shared.cube.lock().unwrap();
-                let phase = *shared.phase.lock().unwrap();
-                let run_st = *shared.run_state.lock().unwrap();
-                let total_mv = shared.total_moves.load(Ordering::Relaxed);
-                let total_us = shared.total_elapsed_us.load(Ordering::Relaxed);
-                (cube.clone(), phase, run_st, total_mv, total_us)
+                (cube.clone(),
+                 *shared.phase.lock().unwrap(),
+                 *shared.run_state.lock().unwrap(),
+                 shared.total_moves.load(Ordering::Relaxed),
+                 shared.total_elapsed_us.load(Ordering::Relaxed))
             };
 
-            // 更新 HTTP /status 快照（JSON 格式）
             let solved = cube_snap.solved_count();
-            let pct = solved as f64 / TOTAL as f64 * 100.0;
-            let phase_str = match phase {
-                SolvePhase::CenterReduction      => "center_reduction",
-                SolvePhase::EdgePairing          => "edge_pairing",
-                SolvePhase::ThreeByThreeReduction => "3x3_reduction",
-                SolvePhase::Solved               => "solved",
-            };
-            let run_str = match run_st {
-                RunState::Running => "running",
-                RunState::Paused  => "paused",
-            };
-            let avg_us = if total_mv > 0 { total_us / total_mv } else { 0 };
-            let snap_json = format!(
-                concat!(
-                    "{{",
-                    "\"state\":\"{state}\",",
-                    "\"phase\":\"{phase}\",",
-                    "\"solved_cells\":{solved},",
-                    "\"total_cells\":{total},",
-                    "\"solved_pct\":{pct:.4},",
-                    "\"total_moves\":{moves},",
-                    "\"avg_move_us\":{avg_us}",
-                    "}}"
-                ),
-                state  = run_str,
-                phase  = phase_str,
-                solved = solved,
-                total  = TOTAL,
-                pct    = pct,
-                moves  = total_mv,
-                avg_us = avg_us,
-            );
-            *shared.status_snapshot.write().unwrap() = snap_json;
+            let pct    = solved as f64 / TOTAL as f64 * 100.0;
+            let avg_us = if mv > 0 { us / mv } else { 0 };
 
-            // 若正在运行，将快照推给探索线程（非阻塞 try_send，丢弃则跳过）
+            let phase_str = match phase {
+                SolvePhase::CenterReduction       => "center_reduction",
+                SolvePhase::EdgePairing           => "edge_pairing",
+                SolvePhase::ThreeByThreeReduction => "3x3_reduction",
+                SolvePhase::Solved                => "solved",
+            };
+            let run_str = if run_st == RunState::Running { "running" } else { "paused" };
+
+            // 精简 status JSON（≈200 字节）
+            *shared.status_snapshot.write().unwrap() = format!(
+                "{{\"state\":\"{run_str}\",\"phase\":\"{phase_str}\",\
+                  \"solved_cells\":{solved},\"total_cells\":{TOTAL},\
+                  \"solved_pct\":{pct:.6},\"total_moves\":{mv},\"avg_move_us\":{avg_us}}}"
+            );
+
+            // 完整 cube JSON（包含 Base64 数据，≈330KB）
+            // Python 端每次需要重渲染展开图时 GET /cube
+            *shared.cube_snapshot.write().unwrap() = format!(
+                "{{\"n\":{N},\"faces\":{FACES},\"state\":\"{run_str}\",\"data\":\"{}\"}}",
+                cube_snap.to_base64()
+            );
+
+            // 广播给探索器
             if run_st == RunState::Running {
                 let _ = snapshot_tx.try_send(cube_snap);
             }
+
+            eprintln!("[tick] {run_str} | {phase_str} | {solved}/{TOTAL} = {pct:.2}% | moves={mv}");
         }
 
-        // 短暂 sleep，避免空转烧 CPU（1ms 足够保证 200Hz 精度）
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(10));
     }
 
     eprintln!("[scheduler] 退出");
 }
 
 // ============================================================
-// 探索线程（Explorer × 8）
-// ============================================================
-//
-// 每个探索线程：
-//   1. 阻塞等待调度线程推来的最新快照
-//   2. 根据当前阶段生成候选动作序列
-//   3. 对每个候选在本地副本上快速模拟，计算启发代价
-//   4. 将最优候选通过 result_tx 提交给执行线程
+// 探索线程（×8）
 // ============================================================
 
-fn explorer_thread(
-    id: usize,
-    shared: Arc<SharedState>,
-    snapshot_rx: Receiver<CubeState>,
-    result_tx: SyncSender<ExplorerResult>,
-) {
-    eprintln!("[explorer-{}] 启动", id);
-
+fn explorer_thread(id: usize, shared: Arc<SharedState>, rx: Receiver<CubeState>, tx: SyncSender<ExplorerResult>) {
+    eprintln!("[explorer-{id}] 启动");
     loop {
         if shared.shutdown.load(Ordering::Relaxed) { break; }
-
-        // 阻塞等待新快照（超时 50ms 后重新检查 shutdown）
-        let state = match snapshot_rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-
+        let state = match rx.recv_timeout(Duration::from_millis(50)) { Ok(s)=>s, Err(_)=>continue };
         let t0 = Instant::now();
-
-        // 检测当前阶段
         let phase = detect_phase(&state);
-        if phase == SolvePhase::Solved {
-            eprintln!("[explorer-{}] 魔方已解决！", id);
-            break;
-        }
+        if phase == SolvePhase::Solved { eprintln!("[explorer-{id}] 已解决"); break; }
 
-        // 根据阶段和探索器 ID 分配候选集
-        // 8个探索器分工：
-        //   0-1: 中心块候选（U/D 轴各层）
-        //   2-3: 中心块候选（R/L 轴各层）
-        //   4-5: 棱块配对候选
-        //   6-7: 3阶或综合候选
-        let candidates: Vec<Vec<Move>> = match (phase, id) {
-            (SolvePhase::CenterReduction, 0 | 1) => {
-                // U/D 轴：按探索器 ID 分配不同层范围
-                let range_start = id * (N / 2 / 2);
-                let range_end   = (range_start + N / 4).min(N);
-                let mut cands = Vec::new();
-                for layer in range_start..range_end {
-                    cands.extend(center_candidate_moves(&state, U_FACE, layer));
-                }
-                cands
+        let cands: Vec<Vec<Move>> = match (phase, id) {
+            (SolvePhase::CenterReduction, 0|1) => {
+                let r0=id*(N/4); (r0..(r0+N/4).min(N)).flat_map(|l| center_candidate_moves(&state,U_FACE,l)).collect()
             }
-            (SolvePhase::CenterReduction, 2 | 3) => {
-                let offset = (id - 2) * (N / 4);
-                let range_start = N / 2 + offset;
-                let range_end   = (range_start + N / 4).min(N);
-                let mut cands = Vec::new();
-                for layer in range_start..range_end {
-                    cands.extend(center_candidate_moves(&state, R_FACE, layer));
-                }
-                cands
+            (SolvePhase::CenterReduction, 2|3) => {
+                let r0=(id-2)*(N/4)+N/2; (r0..(r0+N/4).min(N)).flat_map(|l| center_candidate_moves(&state,R_FACE,l)).collect()
             }
             (SolvePhase::CenterReduction, _) => {
-                // 剩余探索器覆盖 F/B/L 面
-                let face = [F_FACE, D_FACE, L_FACE, B_FACE][(id - 4).min(3)];
-                let mut cands = Vec::new();
-                for layer in (id * 10)..(id * 10 + 20).min(N) {
-                    cands.extend(center_candidate_moves(&state, face, layer));
-                }
-                cands
+                let face=[F_FACE,D_FACE,L_FACE,B_FACE][(id-4).min(3)];
+                (id*10..(id*10+20).min(N)).flat_map(|l| center_candidate_moves(&state,face,l)).collect()
             }
             (SolvePhase::EdgePairing, _) => {
-                // 棱块：每个探索器负责一段层区间
-                let range_start = id * (N / EXPLORER_COUNT);
-                let range_end = (range_start + N / EXPLORER_COUNT).min(N);
-                let mut cands = Vec::new();
-                for layer in range_start..range_end {
-                    cands.extend(edge_pairing_candidates(layer));
-                }
-                cands
+                let r0=id*(N/EXPLORER_COUNT);
+                (r0..(r0+N/EXPLORER_COUNT).min(N)).flat_map(|l| edge_pairing_candidates(l)).collect()
             }
-            (SolvePhase::ThreeByThreeReduction, _) | (SolvePhase::Solved, _) => {
-                three_stage_candidates()
-            }
+            _ => three_stage_candidates(),
         };
 
-        // 评估所有候选，找代价最低的
-        let mut best_cost = i64::MAX;
-        let mut best_moves: Vec<Move> = Vec::new();
-
-        for moves in &candidates {
-            let mut sim = state.clone();
-            sim.apply_seq(moves);
+        let (mut best_cost, mut best_moves) = (i64::MAX, Vec::new());
+        for moves in &cands {
+            let mut sim = state.clone(); sim.apply_seq(moves);
             let cost = sim.heuristic_cost();
-            if cost < best_cost {
-                best_cost = cost;
-                best_moves = moves.clone();
-            }
+            if cost < best_cost { best_cost = cost; best_moves = moves.clone(); }
         }
-
-        let elapsed_us = t0.elapsed().as_micros() as u64;
-
-        // 提交结果（非阻塞，若通道满则本轮结果丢弃）
-        let _ = result_tx.try_send(ExplorerResult {
-            explorer_id: id,
-            moves: best_moves,
-            predicted_cost: best_cost,
-            elapsed_us,
-        });
+        let _ = tx.try_send(ExplorerResult { explorer_id:id, moves:best_moves, predicted_cost:best_cost, elapsed_us:t0.elapsed().as_micros()as u64 });
     }
-
-    eprintln!("[explorer-{}] 退出", id);
+    eprintln!("[explorer-{id}] 退出");
 }
 
 // ============================================================
-// 执行线程（Executor）
-// ============================================================
-//
-// 从 8 个探索线程收集结果，选择预测代价最低的，
-// 实际修改全局魔方状态，更新统计数据。
+// 执行线程
 // ============================================================
 
-fn executor_thread(
-    shared: Arc<SharedState>,
-    result_rx: Receiver<ExplorerResult>,
-) {
+fn executor_thread(shared: Arc<SharedState>, rx: Receiver<ExplorerResult>) {
     eprintln!("[executor] 启动");
-
-    // 每轮收集窗口：最多等 20ms，收集尽量多的探索结果后选最优
-    const COLLECT_WINDOW: Duration = Duration::from_millis(20);
-
     loop {
         if shared.shutdown.load(Ordering::Relaxed) { break; }
+        if *shared.run_state.lock().unwrap() == RunState::Paused { thread::sleep(Duration::from_millis(10)); continue; }
 
-        // 检查是否暂停
-        {
-            let rs = shared.run_state.lock().unwrap();
-            if *rs == RunState::Paused {
-                drop(rs);
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-        }
-
-        // 收集窗口内的所有探索结果
-        let window_start = Instant::now();
-        let mut results: Vec<ExplorerResult> = Vec::with_capacity(EXPLORER_COUNT);
-
+        let t_win = Instant::now();
+        let mut results = Vec::with_capacity(EXPLORER_COUNT);
         loop {
-            let remaining = COLLECT_WINDOW.saturating_sub(window_start.elapsed());
-            if remaining.is_zero() { break; }
-
-            match result_rx.recv_timeout(remaining.min(Duration::from_millis(5))) {
-                Ok(r) => { results.push(r); }
-                Err(_) => break,
-            }
+            let rem = Duration::from_millis(20).saturating_sub(t_win.elapsed());
+            if rem.is_zero() { break; }
+            match rx.recv_timeout(rem.min(Duration::from_millis(5))) { Ok(r)=>results.push(r), Err(_)=>break }
         }
+        if results.is_empty() { thread::sleep(Duration::from_millis(5)); continue; }
 
-        if results.is_empty() {
-            thread::sleep(Duration::from_millis(5));
-            continue;
-        }
-
-        // 选预测代价最低的
         let best = results.iter().min_by_key(|r| r.predicted_cost).unwrap();
-
         if best.moves.is_empty() { continue; }
 
         let t0 = Instant::now();
-
-        // 实际执行
         {
             let mut cube = shared.cube.lock().unwrap();
             cube.apply_seq(&best.moves);
-
-            // 更新阶段
-            let new_phase = detect_phase(&cube);
-            *shared.phase.lock().unwrap() = new_phase;
-
-            if new_phase == SolvePhase::Solved {
-                eprintln!("[executor] 🎉 魔方已完全复原！");
+            let ph = detect_phase(&cube);
+            *shared.phase.lock().unwrap() = ph;
+            if ph == SolvePhase::Solved {
+                eprintln!("[executor] 🎉 复原完成！");
                 shared.shutdown.store(true, Ordering::SeqCst);
             }
         }
-
-        let exec_us = t0.elapsed().as_micros() as u64;
-        let move_count = best.moves.len() as u64;
-
-        shared.total_moves.fetch_add(move_count, Ordering::Relaxed);
-        shared.total_elapsed_us.fetch_add(
-            exec_us + best.elapsed_us,
-            Ordering::Relaxed,
-        );
-
-        // 每 1000 步打印进度
-        let total = shared.total_moves.load(Ordering::Relaxed);
-        if total % 1000 == 0 {
-            let cube = shared.cube.lock().unwrap();
-            let solved = cube.solved_count();
-            let pct = solved as f64 / TOTAL as f64 * 100.0;
-            eprintln!(
-                "[executor] steps={} solved={}/{} ({:.2}%) best_from=explorer-{}",
-                total, solved, TOTAL, pct, best.explorer_id
-            );
-        }
+        shared.total_moves.fetch_add(best.moves.len() as u64, Ordering::Relaxed);
+        shared.total_elapsed_us.fetch_add(t0.elapsed().as_micros() as u64 + best.elapsed_us, Ordering::Relaxed);
     }
-
     eprintln!("[executor] 退出");
 }
-
-// ============================================================
-// 通道拓扑构建
-// ============================================================
-//
-// 调度 ──(SyncSender<CubeState> × 8)──► 探索器[0..7]
-//                                             │
-//                              (SyncSender<ExplorerResult>)
-//                                             ▼
-//                                         执行线程
-//
-// SyncSender 有界通道（容量=1）保证低延迟：若消费者跟不上，
-// 生产者 try_send 直接丢弃，不阻塞关键路径。
-// ============================================================
 
 // ============================================================
 // main
 // ============================================================
 
 fn main() {
-    // ---- 1. 加载 data.bin ----
-    let bin_path = "data.bin";
-    let raw = std::fs::read(bin_path).unwrap_or_else(|e| {
-        eprintln!("无法读取 {}: {}（请先运行 init 生成 data.bin）", bin_path, e);
-        std::process::exit(1);
+    let raw = std::fs::read("data.bin").unwrap_or_else(|e| {
+        eprintln!("无法读取 data.bin: {e}"); std::process::exit(1);
     });
     let cube = CubeState::from_bytes(&raw);
-    eprintln!(
-        "已加载 {} — 当前已归位格子: {}/{} ({:.2}%)",
-        bin_path,
-        cube.solved_count(),
-        TOTAL,
-        cube.solved_count() as f64 / TOTAL as f64 * 100.0
-    );
-    eprintln!("初始求解阶段: {:?}", detect_phase(&cube));
+    eprintln!("已加载 data.bin — 归位 {}/{TOTAL} ({:.2}%) 阶段: {:?}",
+        cube.solved_count(), cube.solved_count() as f64/TOTAL as f64*100.0, detect_phase(&cube));
 
-    // ---- 2. 构建共享状态 ----
     let shared = SharedState::new(cube);
 
-    // ---- 3. 构建通道 ----
-
-    // 调度 → 探索器：每个探索器一个有界通道（容量=1，低延迟快照）
-    let mut snapshot_txs: Vec<SyncSender<CubeState>> = Vec::with_capacity(EXPLORER_COUNT);
-    let mut snapshot_rxs: Vec<Option<Receiver<CubeState>>> = (0..EXPLORER_COUNT).map(|_| {
-        let (tx, rx) = mpsc::sync_channel::<CubeState>(1);
-        snapshot_txs.push(tx);
-        Some(rx)
+    // 探索器通道（×8，容量1）
+    let mut snap_txs = Vec::with_capacity(EXPLORER_COUNT);
+    let mut snap_rxs: Vec<_> = (0..EXPLORER_COUNT).map(|_| {
+        let (tx,rx) = mpsc::sync_channel::<CubeState>(1); snap_txs.push(tx); Some(rx)
     }).collect();
 
-    // 探索器 → 执行线程：合并通道（容量=EXPLORER_COUNT）
-    let (result_tx, result_rx) = mpsc::sync_channel::<ExplorerResult>(EXPLORER_COUNT);
+    // 执行器通道
+    let (res_tx, res_rx) = mpsc::sync_channel::<ExplorerResult>(EXPLORER_COUNT);
 
-    // ---- 4. 启动探索线程（8个）----
+    // 启动探索线程
     for id in 0..EXPLORER_COUNT {
-        let shared_c = Arc::clone(&shared);
-        let snap_rx = snapshot_rxs[id].take().unwrap();
-        let res_tx = result_tx.clone();
-        thread::Builder::new()
-            .name(format!("explorer-{}", id))
-            .stack_size(4 * 1024 * 1024) // 4MB 栈（模拟用临时数组）
-            .spawn(move || explorer_thread(id, shared_c, snap_rx, res_tx))
-            .expect("启动探索线程失败");
+        let (sc, rx, tx) = (Arc::clone(&shared), snap_rxs[id].take().unwrap(), res_tx.clone());
+        thread::Builder::new().name(format!("explorer-{id}")).stack_size(4*1024*1024)
+            .spawn(move || explorer_thread(id, sc, rx, tx)).unwrap();
     }
-    drop(result_tx); // main 不再持有发送端
+    drop(res_tx);
 
-    // ---- 5. 启动执行线程（1个）----
-    {
-        let shared_c = Arc::clone(&shared);
-        thread::Builder::new()
-            .name("executor".into())
-            .stack_size(4 * 1024 * 1024)
-            .spawn(move || executor_thread(shared_c, result_rx))
-            .expect("启动执行线程失败");
-    }
+    // 启动执行线程
+    { let sc=Arc::clone(&shared); thread::Builder::new().name("executor".into()).stack_size(4*1024*1024)
+        .spawn(move || executor_thread(sc, res_rx)).unwrap(); }
 
-    // ---- 6. 调度线程广播器（将单个 snapshot_tx 扇出给8个通道）----
-    // 构建一个合并发送者：调度线程每 Tick 向所有探索器发送同一份快照
-    // 此处用 Mutex<Vec<SyncSender>> 实现动态广播
-    let broadcast_txs: Arc<Mutex<Vec<SyncSender<CubeState>>>> =
-        Arc::new(Mutex::new(snapshot_txs));
-
-    // 实际调度线程需要一个单一的 SyncSender；我们用一个"广播代理线程"桥接
+    // 广播代理
+    let bcast_txs = Arc::new(Mutex::new(snap_txs));
     let (bcast_tx, bcast_rx) = mpsc::sync_channel::<CubeState>(1);
-    {
-        let txs = Arc::clone(&broadcast_txs);
-        thread::Builder::new()
-            .name("broadcaster".into())
-            .spawn(move || {
-                while let Ok(snap) = bcast_rx.recv() {
-                    let txs = txs.lock().unwrap();
-                    for tx in txs.iter() {
-                        let _ = tx.try_send(snap.clone());
-                    }
-                }
-            })
-            .expect("启动广播线程失败");
-    }
+    { let txs=Arc::clone(&bcast_txs);
+      thread::Builder::new().name("broadcaster".into()).spawn(move || {
+          while let Ok(snap)=bcast_rx.recv() { let ts=txs.lock().unwrap(); for t in ts.iter() { let _=t.try_send(snap.clone()); } }
+      }).unwrap(); }
 
-    // ---- 7. 主线程运行调度（HTTP + Tick）----
-    eprintln!("所有线程已启动。");
-    eprintln!("API: GET  http://{}/status", HTTP_ADDR);
-    eprintln!("API: POST http://{}/control  body: start|pause|shutdown", HTTP_ADDR);
-    eprintln!("发送 POST /control 并携带 \"start\" 开始求解。");
-
+    eprintln!("=== 就绪 === GET /health /status /cube | POST /control");
     scheduler_thread(shared, bcast_tx);
-
-    eprintln!("主线程退出。");
+    eprintln!("退出。");
 }
